@@ -1,0 +1,120 @@
+// NIST-developed software is provided by NIST as a public service. You may use, copy and distribute copies of the
+// software in any medium, provided that you keep intact this entire notice. You may improve, modify and create
+// derivative works of the software or any portion of the software, and you may copy and distribute such modifications
+// or works. Modified works should carry a notice stating that you changed the software and should note the date and
+// nature of any such change. Please explicitly acknowledge the National Institute of Standards and Technology as the
+// source of the software. NIST-developed software is expressly provided "AS IS." NIST MAKES NO WARRANTY OF ANY KIND,
+// EXPRESS, IMPLIED, IN FACT OR ARISING BY OPERATION OF LAW, INCLUDING, WITHOUT LIMITATION, THE IMPLIED WARRANTY OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, NON-INFRINGEMENT AND DATA ACCURACY. NIST NEITHER REPRESENTS NOR
+// WARRANTS THAT THE OPERATION OF THE SOFTWARE WILL BE UNINTERRUPTED OR ERROR-FREE, OR THAT ANY DEFECTS WILL BE
+// CORRECTED. NIST DOES NOT WARRANT OR MAKE ANY REPRESENTATIONS REGARDING THE USE OF THE SOFTWARE OR THE RESULTS
+// THEREOF, INCLUDING BUT NOT LIMITED TO THE CORRECTNESS, ACCURACY, RELIABILITY, OR USEFULNESS OF THE SOFTWARE. You
+// are solely responsible for determining the appropriateness of using and distributing the software and you assume
+// all risks associated with its use, including but not limited to the risks and costs of program errors, compliance
+// with applicable laws, damage to or loss of data, programs or equipment, and the unavailability or interruption of
+// operation. This software is not intended to be used in any situation where a failure could cause risk of injury or
+// damage to property. The software developed by NIST employees is not subject to copyright protection within the
+// United States.
+
+#ifndef HEDGEHOG_TOOL_CONFIG
+#define HEDGEHOG_TOOL_CONFIG
+
+#include <type_traits>
+#include "concepts.hpp"
+#include "../graph/edge.hpp"
+#include "../tool/type_list.hpp"
+#include "../impl/io/lock_queue_input.hpp"
+#include "../impl/io/lock_free_input.hpp"
+#include "../impl/graph/thread_runner.hpp"
+#include "../impl/graph/graph_sink.hpp"
+#include "../impl/graph/serial_sink.hpp"
+#include "../impl/graph/serial_runner.hpp"
+#include "../impl/graph/direct_edge_builder.hpp"
+
+namespace hh {
+
+// Defaults ////////////////////////////////////////////////////////////////////
+
+template <typename InputList>
+using DefaultNodeInput = type_list_dispatch<InputList, LockQueueNodeInput>;
+
+template <typename OutputList>
+using DefaultNodeOutput = type_list_dispatch<OutputList, EdgeSlots>;
+
+using DefaultGraphRunner = ThreadRunner;
+
+// Fields deducers /////////////////////////////////////////////////////////////
+
+// Node Input //////////////////////////
+
+template <typename Impl, typename Default>
+struct deduce_node_input_type {
+    using type = Default;
+};
+
+template <HasNodeInput Impl, typename Default>
+struct deduce_node_input_type<Impl, Default> {
+    using type = typename Impl::node_input;
+};
+
+// Node Output /////////////////////////
+
+template <typename Impl, typename Default>
+struct deduce_node_output_type {
+    using type = Default;
+};
+
+template <HasNodeOutput Impl, typename Default>
+struct deduce_node_output_type<Impl, Default> {
+    using type = typename Impl::node_output;
+};
+
+// task config /////////////////////////////////////////////////////////////////
+
+template <typename Impl>
+struct deduce_task_io : Impl {};
+
+template <HasIO Impl>
+struct deduce_task_io<Impl> : Impl::io {};
+
+//
+// The task configuration is deduced based on the user tasks type.
+//
+template <typename Impl>
+struct make_task_config {
+    using io = deduce_task_io<Impl>;
+    using InputTypes  = io::inputs;
+    using OutputTypes = io::outputs;
+    using Input  = typename deduce_node_input_type<Impl, DefaultNodeInput<InputTypes>>::type;
+    using Output = typename deduce_node_output_type<Impl, DefaultNodeOutput<OutputTypes>>::type;
+    using Task = Impl;
+};
+
+// graph config ////////////////////////////////////////////////////////////////
+
+template <typename RunnerType, size_t Sep, typename ...Types>
+struct make_graph_config {
+    using io = io_types<Sep, Types...>;
+    using InputTypes = io::inputs;
+    using OutputTypes = io::outputs;
+    using Sink = type_list_dispatch<OutputTypes, GraphSink>;
+    using Runner = RunnerType;
+    using EdgeBuilder = DirectEdgeBuilder;
+};
+
+template <size_t Sep, typename ...Types>
+using make_thread_graph_config = make_graph_config<ThreadRunner, Sep, Types...>;
+
+template <size_t Sep, typename ...Types>
+struct make_serial_graph_config {
+    using io = io_types<Sep, Types...>;
+    using InputTypes = io::outputs;
+    using OutputTypes = io::outputs;
+    using Sink = type_list_dispatch<OutputTypes, SerialSink>;
+    using Runner = SerialRunner;
+    using EdgeBuilder = DirectEdgeBuilder;
+};
+
+} // end namespace hh
+
+#endif

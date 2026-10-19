@@ -1,0 +1,241 @@
+// NIST-developed software is provided by NIST as a public service. You may use, copy and distribute copies of the
+// software in any medium, provided that you keep intact this entire notice. You may improve, modify and create
+// derivative works of the software or any portion of the software, and you may copy and distribute such modifications
+// or works. Modified works should carry a notice stating that you changed the software and should note the date and
+// nature of any such change. Please explicitly acknowledge the National Institute of Standards and Technology as the
+// source of the software. NIST-developed software is expressly provided "AS IS." NIST MAKES NO WARRANTY OF ANY KIND,
+// EXPRESS, IMPLIED, IN FACT OR ARISING BY OPERATION OF LAW, INCLUDING, WITHOUT LIMITATION, THE IMPLIED WARRANTY OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, NON-INFRINGEMENT AND DATA ACCURACY. NIST NEITHER REPRESENTS NOR
+// WARRANTS THAT THE OPERATION OF THE SOFTWARE WILL BE UNINTERRUPTED OR ERROR-FREE, OR THAT ANY DEFECTS WILL BE
+// CORRECTED. NIST DOES NOT WARRANT OR MAKE ANY REPRESENTATIONS REGARDING THE USE OF THE SOFTWARE OR THE RESULTS
+// THEREOF, INCLUDING BUT NOT LIMITED TO THE CORRECTNESS, ACCURACY, RELIABILITY, OR USEFULNESS OF THE SOFTWARE. You
+// are solely responsible for determining the appropriateness of using and distributing the software and you assume
+// all risks associated with its use, including but not limited to the risks and costs of program errors, compliance
+// with applicable laws, damage to or loss of data, programs or equipment, and the unavailability or interruption of
+// operation. This software is not intended to be used in any situation where a failure could cause risk of injury or
+// damage to property. The software developed by NIST employees is not subject to copyright protection within the
+// United States.
+
+#ifndef HEDGEHOG_GRAPH_EDGE
+#define HEDGEHOG_GRAPH_EDGE
+
+#include <functional>
+#include <memory>
+#include <cassert>
+#include "../tool/data.hpp"
+#include "../tool/concepts.hpp"
+#include "../tool/profiling.hpp"
+#include "info.hpp"
+#include "node.hpp"
+
+//
+// Edges are used to connect nodes. Here, we use type erasure to be able to
+// connect any node type to any other node type. It also makes things more
+// manageable because it avoids adding too many interfaces everywhere (reduces
+// interdependencies).
+//
+//
+// NOTE: Nodes inputs/outputs store raw edges structs instead of pointers
+// because benchmarks have shown that dereferencing the pointer had a non
+// negligible impact on performance (this way, all the data required by an edge
+// is loaded with the edge).
+//
+
+namespace hh {
+
+//
+// Edges are used to transfer data between nodes, it acts as a basic
+// directional transfer function. We use an std::function which allow users to
+// capture content when defining custom edges. If the captured content fits in
+// the std::function small buffer, it should not impact the performance (cf
+// SBO).
+//
+template <typename T>
+using EdgeTransfer = std::function<void(Edge<T> *, data_t<T>, RuntimeInfo const &)>;
+
+//
+// The Edge struct holds a transfer function as well as relevant data (so we
+// don't pollute the std::function small buffer).
+//
+template <typename T>
+struct Edge {
+    void *graph = nullptr;
+    void *receiver = nullptr;
+    EdgeTransfer<T> fun;
+
+    Edge(void *graph, void *receiver, EdgeTransfer<T> fun)
+        : graph(graph), receiver(receiver), fun(std::move(fun)) {}
+
+    Edge(Edge<T> const &edge) = default;
+    Edge<T> &operator=(Edge<T> const &edge) = default;
+    Edge(Edge<T> &&edge) = default;
+    Edge<T> &operator=(Edge<T> &&edge) = default;
+
+    void transfer(data_t<T> data, RuntimeInfo const &info) {
+        fun(this, std::move(data), info);
+    }
+};
+
+static_assert(sizeof(Edge<int>) <= 64, "Edge should fit on a cache line.");
+
+// Edge Transfer Proxy /////////////////////////////////////////////////////////
+
+//
+// EdgeTransferProxy is a helper struct that is used to provide a nicer API to
+// custom edges. Directly constructing an Edge<T> is feasible, but it requires
+// manual type casting, graph executor management and enforces the type of the
+// user lambda. EdgeTransferProxy creates an Edge transfer function used as a
+// proxy that handles the type casting, the graph executor, and forwards
+// arguments to the user lambda. It also allows using different lambda
+// signatures depending on which iformation is required to handle the transfer.
+//
+template <typename Config>
+struct EdgeTransferProxy {
+    using Type = Config::Type;
+    using Impl = Config::Impl;
+    using Graph = Config::Graph;
+    using Receiver = Config::Receiver;
+
+    Impl impl;
+
+    EdgeTransferProxy(Impl impl): impl(std::move(impl)) {}
+
+    void operator()(Edge<Type> *edge, data_t<Type> data, RuntimeInfo const &info) {
+        using Runner = Graph::Runner;
+
+        bool success = true;
+        auto receiver = static_cast<Config::Receiver *>(edge->receiver);
+        auto graph = static_cast<Graph *>(edge->graph);
+
+        if constexpr (requires { impl(graph, receiver, std::move(data), info); }) {
+            success = impl(graph, receiver, std::move(data), info);
+        } else if constexpr (requires { impl(receiver, std::move(data), info); }) {
+            success = impl(receiver, std::move(data), info);
+        } else {
+            success = impl(std::move(data), info);
+        }
+
+        if (success) [[likely]] {
+            graph->runner()->on_transfer(receiver, info);
+        }
+    }
+};
+
+//
+// Creates an edge using the given graph, receiver node and user lambda.
+//
+template <typename T>
+Edge<T> make_edge(auto graph, auto receiver, auto impl) {
+    struct Config {
+        using Type = T;
+        using Impl = decltype(impl);
+        using Graph = std::remove_pointer_t<decltype(graph)>;
+        using Receiver = std::remove_pointer_t<decltype(receiver)>;
+    };
+    return Edge<T>(graph, receiver, EdgeTransferProxy<Config>(impl));
+}
+
+// Connections /////////////////////////////////////////////////////////////////
+
+//
+// Non-template connection descriptor used by the graph (used for building the
+// graph view).
+//
+struct Connection {
+    Node *sender;
+    Node *receiver;
+    std::string type_name;
+};
+
+// Edge slot ///////////////////////////////////////////////////////////////////
+
+//
+// An edge slot is just a collection of edges. This type can be used as graph
+// input or task node output. EdgesSlots allows having different slot lists for
+// different types.
+//
+
+template <typename T>
+struct EdgeSlot {
+    std::vector<Edge<T>> edges_;
+};
+
+template <typename ...Types>
+struct EdgeSlots : EdgeSlot<Types>... {
+    void initialize(InitializationInfo const &) {}
+    void finalize(InitializationInfo const &) {}
+
+    template <typename T>
+    void push_data(data_t<T> data, RuntimeInfo const &info) {
+        auto &edges = EdgeSlot<T>::edges_;
+        size_t edge_count = edges.size();
+        if (edge_count == 0) [[unlikely]] return;
+        for (size_t i = 1; i < edge_count; ++i) {
+            edges[i].transfer(data, info);
+        }
+        edges[0].transfer(std::move(data), info);
+    }
+
+    template <typename T>
+    void connect_edge(Edge<T> edge) {
+        EdgeSlot<T>::edges_.push_back(std::move(edge));
+    }
+
+    template <typename T>
+    std::vector<Edge<T>> &edges() { return EdgeSlot<T>::edges_; }
+
+    size_t edge_count() { return (EdgeSlot<Types>::edges_.size() + ...); }
+};
+
+
+// Edge connector //////////////////////////////////////////////////////////////
+
+//
+// The edge connector is used to defer edge connection. This is mainly used to
+// connect graph output nodes as it allows making straight connections across
+// sub-graph boundaries (edge flattening).
+//
+// Note that we could use interfaces instead of this (we don't need optimal
+// performance for the graph initialization machinery), but std::function
+// allows to do this without adding extra inheritance layers in every node
+// implementation.
+//
+
+template <typename T>
+using ConnectFunction = std::function<void(Edge<T>)>;
+
+template <typename T>
+struct EdgeConnector {
+    std::vector<ConnectFunction<T>> connects_;
+    std::vector<Node *> nodes_;
+};
+
+template <typename ...Types>
+struct EdgeConnectors : EdgeConnector<Types>... {
+    void initialize(InitializationInfo const &) {}
+    void finalize(InitializationInfo const &) {}
+
+    template <typename T>
+    void connect(Edge<T> edge) {
+        for (auto &connect : EdgeConnector<T>::connects_) {
+            connect(edge);
+        }
+    }
+
+    template <typename T>
+    void add_connect(ConnectFunction<T> connect) {
+        EdgeConnector<T>::connects_.push_back(std::move(connect));
+    }
+
+    template <typename T>
+    void add_node(Node *node) {
+        EdgeConnector<T>::nodes_.push_back(node);
+    }
+
+    template <typename T>
+    std::vector<Node *> const &nodes() const { return EdgeConnector<T>::nodes_; }
+};
+
+} // end namespace hh
+
+#endif

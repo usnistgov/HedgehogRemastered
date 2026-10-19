@@ -1,0 +1,155 @@
+// NIST-developed software is provided by NIST as a public service. You may use, copy and distribute copies of the
+// software in any medium, provided that you keep intact this entire notice. You may improve, modify and create
+// derivative works of the software or any portion of the software, and you may copy and distribute such modifications
+// or works. Modified works should carry a notice stating that you changed the software and should note the date and
+// nature of any such change. Please explicitly acknowledge the National Institute of Standards and Technology as the
+// source of the software. NIST-developed software is expressly provided "AS IS." NIST MAKES NO WARRANTY OF ANY KIND,
+// EXPRESS, IMPLIED, IN FACT OR ARISING BY OPERATION OF LAW, INCLUDING, WITHOUT LIMITATION, THE IMPLIED WARRANTY OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, NON-INFRINGEMENT AND DATA ACCURACY. NIST NEITHER REPRESENTS NOR
+// WARRANTS THAT THE OPERATION OF THE SOFTWARE WILL BE UNINTERRUPTED OR ERROR-FREE, OR THAT ANY DEFECTS WILL BE
+// CORRECTED. NIST DOES NOT WARRANT OR MAKE ANY REPRESENTATIONS REGARDING THE USE OF THE SOFTWARE OR THE RESULTS
+// THEREOF, INCLUDING BUT NOT LIMITED TO THE CORRECTNESS, ACCURACY, RELIABILITY, OR USEFULNESS OF THE SOFTWARE. You
+// are solely responsible for determining the appropriateness of using and distributing the software and you assume
+// all risks associated with its use, including but not limited to the risks and costs of program errors, compliance
+// with applicable laws, damage to or loss of data, programs or equipment, and the unavailability or interruption of
+// operation. This software is not intended to be used in any situation where a failure could cause risk of injury or
+// damage to property. The software developed by NIST employees is not subject to copyright protection within the
+// United States.
+
+#ifndef HEDGEHOG_GRAPH_NODE
+#define HEDGEHOG_GRAPH_NODE
+
+#include <memory>
+#include <map>
+#include "../tool/type_list.hpp"
+#include "../tool/profiling.hpp"
+#include "../tool/graph_view.hpp"
+#include "../tool/data.hpp"
+#include "info.hpp"
+
+namespace hh {
+
+//
+// Node interface used in the graph.
+//
+
+class Node {
+    Node *parent_{nullptr};
+    NodeInfo info_{};
+    Profiler profiler_{};
+
+  public:
+    Node(NodeInfo info) : info_(info) {}
+
+    NodeInfo const &info() { return info_; }
+    Profiler &profiler() { return profiler_; }
+
+    Node *parent() { return parent_; }
+    void parent(Node *parent) { parent_ = parent; }
+
+    size_t number_threads() const { return info_.number_threads; }
+    void number_threads(size_t n) { info_.number_threads = n; }
+
+    std::string name() const { return info_.name; }
+    void name(std::string name) { info_.name = std::move(name); }
+
+    virtual void initialize(GraphInfo const &info) = 0;
+    virtual void run(RunInfo const &info) = 0;
+    virtual void finalize(GraphInfo const &info) = 0;
+    virtual GraphViewNode *graph_view(GraphView *gv) = 0;
+
+    virtual void profile(ProfileMap &map) {
+        ProfileReport report;
+        #ifdef HH_ENABLE_PROFILING
+        report.add_profiles(profiler_);
+        #endif
+        map[reinterpret_cast<uintptr_t>(this)] = std::move(report);
+    }
+};
+
+// Task Handle /////////////////////////////////////////////////////////////////
+
+//
+// Argument of node input signal function (thread wake-up)
+//
+struct SignalOpts {
+    size_t count;        // number of threads to signal
+    size_t thread_index; // signal a particular thread
+};
+
+//
+// Result of node input wait function (returned when threads exit sleep).
+//
+struct WaitResult {
+    bool terminate; // used to leave the thread loop
+    bool skip;      // used to skip execution in the thread loop (no data, or defered)
+};
+
+//
+// Interface for runnable nodes (nodes that consume and process data).
+//
+struct Runnable {
+    int runner_index_ = -1;
+
+    int runner_index() const { return runner_index_; }
+    void runner_index(int idx) { runner_index_ = idx; }
+
+    virtual void initialize(RuntimeInfo const &) = 0;
+    virtual void finalize(RuntimeInfo const &) = 0;
+    virtual WaitResult wait(RuntimeInfo const &) = 0;
+    virtual size_t execute_all(RuntimeInfo const &) = 0;
+    virtual bool execute_one(RuntimeInfo const &) = 0;
+    virtual ~Runnable() = default;
+};
+
+// Node IO /////////////////////////////////////////////////////////////////////
+
+template <typename T>
+struct Edge;
+
+//
+// Node input/output specifications.
+//
+// Those concepts are not used internally to reduce compile times, but one can
+// enable them with HH_ENABLE_CONCEPTS to verify custom implementations.
+//
+
+#ifdef HH_ENABLE_CONCEPTS
+
+template <typename T, typename ...Inputs>
+concept NodeInputTrait = std::default_initializable<T>
+    && requires(T t, InitializationInfo const &info) {
+        t.initialize(info);
+        t.finalize(info);
+    }
+    && requires(T t, RuntimeInfo const &ri, SignalOpts opts) {
+        { t.wait(ri) } -> std::same_as<WaitResult>;
+        { t.signal(opts) };
+    }
+    && requires(T t, void *exec, RuntimeInfo const &ri) {
+        t.execute_one(exec, ri);
+        t.execute_all(exec, ri);
+    }
+    && (requires(T t, data_t<Inputs> d, RuntimeInfo const &i) {
+        t.push_data(std::move(d), i);
+    } && ...);
+
+template <typename T, typename ...Outputs>
+concept NodeOutputTrait = std::default_initializable<T>
+    && requires(T t, InitializationInfo const &info) {
+        t.initialize(info);
+        t.finalize(info);
+    }
+    && (requires(T t, data_t<Outputs> data) {
+        t.push_data(data, RuntimeInfo{});
+    } && ...)
+    && (requires(T t, Edge<Outputs> e) {
+        t.connect_edge(std::move(e));
+        t.template edges<Outputs>();
+    } && ...);
+
+#endif // HH_ENABLE_CONCEPTS
+
+} // end namespace hh
+
+#endif

@@ -1,0 +1,164 @@
+// NIST-developed software is provided by NIST as a public service. You may use, copy and distribute copies of the
+// software in any medium, provided that you keep intact this entire notice. You may improve, modify and create
+// derivative works of the software or any portion of the software, and you may copy and distribute such modifications
+// or works. Modified works should carry a notice stating that you changed the software and should note the date and
+// nature of any such change. Please explicitly acknowledge the National Institute of Standards and Technology as the
+// source of the software. NIST-developed software is expressly provided "AS IS." NIST MAKES NO WARRANTY OF ANY KIND,
+// EXPRESS, IMPLIED, IN FACT OR ARISING BY OPERATION OF LAW, INCLUDING, WITHOUT LIMITATION, THE IMPLIED WARRANTY OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, NON-INFRINGEMENT AND DATA ACCURACY. NIST NEITHER REPRESENTS NOR
+// WARRANTS THAT THE OPERATION OF THE SOFTWARE WILL BE UNINTERRUPTED OR ERROR-FREE, OR THAT ANY DEFECTS WILL BE
+// CORRECTED. NIST DOES NOT WARRANT OR MAKE ANY REPRESENTATIONS REGARDING THE USE OF THE SOFTWARE OR THE RESULTS
+// THEREOF, INCLUDING BUT NOT LIMITED TO THE CORRECTNESS, ACCURACY, RELIABILITY, OR USEFULNESS OF THE SOFTWARE. You
+// are solely responsible for determining the appropriateness of using and distributing the software and you assume
+// all risks associated with its use, including but not limited to the risks and costs of program errors, compliance
+// with applicable laws, damage to or loss of data, programs or equipment, and the unavailability or interruption of
+// operation. This software is not intended to be used in any situation where a failure could cause risk of injury or
+// damage to property. The software developed by NIST employees is not subject to copyright protection within the
+// United States.
+
+#ifndef HEDGEHOG_API_EXECUTION_CONTEXT_H
+#define HEDGEHOG_API_EXECUTION_CONTEXT_H
+
+//
+// The execution context is used to exposes the graph node API inside the user
+// tasks (a task is not directly a node, it is an execution core bound to a
+// node).
+//
+
+namespace hh {
+
+// rumtime context /////////////////////////////////////////////////////////////
+
+//
+// Used as an interface that querries the runtime info.
+//
+struct RuntimeContext {
+    RuntimeInfo info_;
+
+    RuntimeInfo const &info() const { return info_; }
+    Profiler &profiler() { return *info_.profiler; }
+    std::string const &name() const { return info_.node->name; }
+    std::string const &graph_name() const { return info_.graph->name; }
+    int graph_id() const { return info_.graph->id; }
+    size_t number_thread() const { return info_.node->number_threads; }
+    size_t thread_index() const { return info_.thread_index; }
+    int numa_id() const { return info_.run.pipeline.numa_id; }
+    int device_id() const { return info_.run.pipeline.device_id; }
+    int rank() const { return info_.run.rank; }
+};
+
+// node execution context //////////////////////////////////////////////////////
+
+//
+// The NodeExecutionContext is passed to the user execution kernels (tasks) and
+// allow accessing node functionalities (like pushing data, retrieving info,
+// ...).
+//
+template <typename NodeType>
+struct NodeExecutionContext : RuntimeContext {
+    NodeType *node_;
+
+    // constructor used by the node
+    void construct(NodeType *node, RuntimeInfo const &info) {
+        node_ = node;
+        RuntimeContext::info_ = info;
+    }
+
+    NodeType &node() { return *node_; }
+
+    template <typename T>
+    void push_data(data_t<T> data) {
+        node_->input().push_data(std::move(data), RuntimeContext::info());
+    }
+
+    template <typename T>
+    void push_data(auto &&...args) {
+        push_data(hh::make_data<T>(std::forward<decltype(args)>(args)...));
+    }
+
+    template <typename T>
+    void push_result(data_t<T> data) {
+        node_->output().push_data(std::move(data), RuntimeContext::info());
+    }
+
+    template <typename T>
+    void push_result(auto &&...args) {
+        push_result(hh::make_data<T>(std::forward<decltype(args)>(args)...));
+    }
+};
+
+// lambda execution context ////////////////////////////////////////////////////
+
+//
+// The node execution context gives access directly to the node, but we cannot
+// do that for the lambda task (recursive type dependencies). This is a
+// minimized context that doesn't depend on the node so that it can be used
+// within lambda tasks.
+//
+// CanPushData<T> / CanPushResult<T> are per-type interfaces that each hold a
+// type-erased function pointer to forward push calls to the real node context.
+//
+
+template <typename T>
+struct CanPushData {
+    void (*fn_)(void *, data_t<T>) = nullptr;
+    void *ctx_ = nullptr;
+
+    void push_data(data_t<T> data) { fn_(ctx_, std::move(data)); }
+
+    template <typename Ctx>
+    void init_push_data(Ctx *ctx) {
+        ctx_ = ctx;
+        fn_ = +[](void *c, data_t<T> data) {
+            reinterpret_cast<Ctx *>(c)->template push_data<T>(std::move(data));
+        };
+    }
+};
+
+template <typename T>
+struct CanPushResult {
+    void (*fn_)(void *, data_t<T>) = nullptr;
+    void *ctx_ = nullptr;
+
+    void push_result(data_t<T> data) { fn_(ctx_, std::move(data)); }
+
+    template <typename Ctx>
+    void init_push_result(Ctx *ctx) {
+        ctx_ = ctx;
+        fn_ = +[](void *c, data_t<T> data) {
+            reinterpret_cast<Ctx *>(c)->template push_result<T>(std::move(data));
+        };
+    }
+};
+
+template <typename Inputs, typename Outputs>
+struct LambdaExecutionContext;
+
+template <typename ...Ins, typename ...Outs>
+struct LambdaExecutionContext<type_list<Ins...>, type_list<Outs...>>
+    : RuntimeContext, CanPushData<Ins>..., CanPushResult<Outs>... {
+
+    using CanPushData<Ins>::push_data...;
+    using CanPushResult<Outs>::push_result...;
+
+    template <typename ExecutionContext>
+    LambdaExecutionContext(ExecutionContext *ctx) {
+        RuntimeContext::info_ = ctx->info();
+        (CanPushData<Ins>::init_push_data(ctx), ...);
+        (CanPushResult<Outs>::init_push_result(ctx), ...);
+    }
+
+    template <typename T>
+    void push_data(auto &&...args) {
+        CanPushData<T>::push_data(hh::make_data<T>(std::forward<decltype(args)>(args)...));
+    }
+
+    template <typename T>
+    void push_result(auto &&...args) {
+        CanPushResult<T>::push_result(hh::make_data<T>(std::forward<decltype(args)>(args)...));
+    }
+};
+
+}
+
+#endif

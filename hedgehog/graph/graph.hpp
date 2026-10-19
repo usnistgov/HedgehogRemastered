@@ -1,0 +1,577 @@
+// NIST-developed software is provided by NIST as a public service. You may use, copy and distribute copies of the
+// software in any medium, provided that you keep intact this entire notice. You may improve, modify and create
+// derivative works of the software or any portion of the software, and you may copy and distribute such modifications
+// or works. Modified works should carry a notice stating that you changed the software and should note the date and
+// nature of any such change. Please explicitly acknowledge the National Institute of Standards and Technology as the
+// source of the software. NIST-developed software is expressly provided "AS IS." NIST MAKES NO WARRANTY OF ANY KIND,
+// EXPRESS, IMPLIED, IN FACT OR ARISING BY OPERATION OF LAW, INCLUDING, WITHOUT LIMITATION, THE IMPLIED WARRANTY OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, NON-INFRINGEMENT AND DATA ACCURACY. NIST NEITHER REPRESENTS NOR
+// WARRANTS THAT THE OPERATION OF THE SOFTWARE WILL BE UNINTERRUPTED OR ERROR-FREE, OR THAT ANY DEFECTS WILL BE
+// CORRECTED. NIST DOES NOT WARRANT OR MAKE ANY REPRESENTATIONS REGARDING THE USE OF THE SOFTWARE OR THE RESULTS
+// THEREOF, INCLUDING BUT NOT LIMITED TO THE CORRECTNESS, ACCURACY, RELIABILITY, OR USEFULNESS OF THE SOFTWARE. You
+// are solely responsible for determining the appropriateness of using and distributing the software and you assume
+// all risks associated with its use, including but not limited to the risks and costs of program errors, compliance
+// with applicable laws, damage to or loss of data, programs or equipment, and the unavailability or interruption of
+// operation. This software is not intended to be used in any situation where a failure could cause risk of injury or
+// damage to property. The software developed by NIST employees is not subject to copyright protection within the
+// United States.
+
+#ifndef HEDGEHOG_GRAPH_GRAPH_H
+#define HEDGEHOG_GRAPH_GRAPH_H
+
+#include <variant>
+#include <cstdio>
+#include <set>
+#include <sstream>
+#include <fstream>
+
+#include "info.hpp"
+#include "node.hpp"
+#include "edge.hpp"
+#include "../tool/helpers.hpp"
+#include "../tool/concepts.hpp"
+#include "../tool/log.hpp"
+#include "../tool/graph_view.hpp"
+#include "../tool/profiling_report.hpp"
+
+//
+// The graph allows to connect and run nodes (connection logic uses nodes
+// input/output types).
+//
+
+namespace hh {
+
+template <typename Config>
+struct Graph : Node {
+    // config //////////////////////////////////////////////////////////////////
+
+    using InputTypes  = Config::InputTypes;
+    using OutputTypes = Config::OutputTypes;
+    using Sink        = Config::Sink;
+    using Runner      = Config::Runner;
+    using EdgeBuilder = Config::EdgeBuilder;
+    using Input       = type_list_dispatch<InputTypes, EdgeSlots>;
+    using Output      = type_list_dispatch<OutputTypes, EdgeConnectors>;
+
+    // attributes & constructors ///////////////////////////////////////////////
+
+    static inline int graph_id_gen_ = 0;
+
+    GraphInfo                       graph_info_   = {};
+    Input                           input_        = {};
+    Output                          output_       = {};
+    std::shared_ptr<Runner>         runner_       = {};
+    Sink                            sink_         = {};
+    std::set<std::shared_ptr<Node>> nodes_        = {};
+    std::set<std::shared_ptr<Node>> input_nodes_  = {};
+    std::set<std::shared_ptr<Node>> output_nodes_ = {};
+    std::vector<Connection>         connections_  = {};
+    bool                            built_        = false;
+
+    #ifdef HH_ENABLE_PROFILING
+    Profile *exec_profile_ = nullptr;
+    #endif
+
+    Graph(std::shared_ptr<Runner>     runner,
+          NodeInfo const               &info)
+        : Node(info),
+          runner_(std::move(runner)) {
+        graph_info_.name = info.name;
+        graph_info_.id = graph_id_gen_++;
+    }
+
+    Input &input() { return input_; }
+    Output &output() { return output_; }
+    Runner *runner() { return runner_.get(); }
+    Sink &sink() { return sink_; }
+    std::set<std::shared_ptr<Node>> const &nodes() const { return nodes_; }
+    std::set<std::shared_ptr<Node>> const &input_nodes() const { return input_nodes_; }
+    std::set<std::shared_ptr<Node>> const &output_nodes() const { return output_nodes_; }
+    std::vector<Connection> const &connections() const { return connections_; }
+
+    // user functions //////////////////////////////////////////////////////////
+
+    //
+    // Setup input connections and output edges once (do not rebuild when the
+    // same graph is executed multiple tiles).
+    //
+    void build_once() {
+        if (built_) return;
+
+        // connect the sink
+        type_list_map<OutputTypes>([this]<typename T>() {
+            output_.connect(Edge<T>(this, &sink_, [](Edge<T> *e, data_t<T> data, RuntimeInfo const &info) {
+                static_cast<Sink *>(e->receiver)->push_data(std::move(data), info);
+            }));
+        });
+
+        // create input connections
+        type_list_map<InputTypes>([&]<typename T>() {
+            auto edges = input_.template edges<T>();
+            for (auto &edge : edges) {
+                connections_.push_back(Connection{
+                    .sender = this,
+                    .receiver = reinterpret_cast<Node *>(edge.receiver),
+                    .type_name = type_to_string<T>(),
+                });
+            }
+        });
+
+        built_ = true;
+    }
+
+    //
+    // Start the graph (launch the runner on every node)
+    //
+    void start(int rank = 0, HH_LOC) {
+        if (this->parent() != nullptr) {
+            log::fatal(loc, "a sub-graph cannot be started");
+        }
+
+        if (log::error_count() > 0) {
+            log::fatal(loc, "graph start aborted due to errors.");
+        }
+
+        build_once();
+
+        if (input_.edge_count() == 0) {
+            log::fatal(loc, "graph has no input connections");
+        }
+
+        sink_.initialize(InitializationInfo{&Node::info(), &graph_info_, nullptr});
+
+        Node::profiler().initialize(Node::info().name);
+
+        HH_PROFILE_REGION(Node::profiler(), "intialization") {
+            initialize_components();
+        }
+
+        #ifdef HH_ENABLE_PROFILING
+        exec_profile_ = Node::profiler().profile_region("execution");
+        exec_profile_->begin_region();
+        #endif
+        RunInfo run_info = {rank, PipelineInfo{}};
+        run(run_info);
+    }
+
+    //
+    // Stop the graph (stop the runner). Note that this is a force stop: the
+    // graph doesn't wait for termination. To wait, one must use the
+    // get_result/eat_results functions.
+    //
+    void stop() {
+        HH_PROFILE_REGION(Node::profiler(), "finalization") {
+            finalize(GraphInfo{Node::info().name, 0});
+        }
+        #ifdef HH_ENABLE_PROFILING
+        exec_profile_->end_region();
+        #endif
+    }
+
+    //
+    // Connection function used with sub-graphs.
+    //
+    template <typename T>
+    void connect_output_edge(Edge<T> edge) {
+        output_.connect(std::move(edge));
+    }
+
+    //
+    // Push data to the inputs of the graph (used internally with sub-graphs).
+    //
+    template <typename T>
+    void push_data(data_t<T> data, RuntimeInfo const &info) {
+        input_.push_data(std::move(data), info);
+    }
+
+    //
+    // Push data to the inputs of the graph and construct the runtime info
+    // (user API; called when pushing data to the root graph).
+    //
+    template <typename T>
+    void push_data(data_t<T> data) {
+        push_data<T>(std::move(data), RuntimeInfo{&Node::info(), &graph_info_, {}, 0, &Node::profiler()});
+    }
+
+    //
+    // Blocks until the sink receives data and returns the data (deadlocks if no
+    // data arrives).
+    //
+    auto get_result() {
+        runner_->on_result();
+        return sink_.get_result();
+    }
+
+    //
+    // Blocks until the sink receives data and discard the result (deadlocks if
+    // no data arrives). This function can eat the specified amount of result
+    // data.
+    //
+    void eat_results(size_t count = 1) {
+        for (size_t i = 0; i < count; ++i) {
+            auto _ = get_result();
+        }
+    }
+
+    // node api ////////////////////////////////////////////////////////////////
+
+    //
+    // Implementation of the functions from the Node interface.
+    //
+
+    void initialize_components() {
+        auto init_info = InitializationInfo{&Node::info(), &graph_info_, &Node::profiler()};
+        input_.initialize(init_info);
+        output_.initialize(init_info);
+        for (auto &node : nodes_) {
+            node->initialize(graph_info_);
+        }
+        runner_->initialize(init_info);
+    }
+
+    void initialize(GraphInfo const &) override {
+        Node::profiler().initialize(Node::info().name);
+        initialize_components();
+    }
+
+    void run(RunInfo const &info) override {
+        runner_->run(info);
+    }
+
+    void finalize(GraphInfo const &) override {
+        auto init_info = InitializationInfo{&Node::info(), &graph_info_, &Node::profiler()};
+        for (auto &node : nodes_) {
+            node->finalize(graph_info_);
+        }
+        runner_->finalize(init_info);
+        input_.finalize(init_info);
+        output_.finalize(init_info);
+        sink_.finalize(init_info);
+        Node::profiler().finalize();
+    }
+
+    void profile(ProfileMap &map) override {
+        Node::profile(map);
+        for (auto &node : nodes_) {
+            node->profile(map);
+        }
+    }
+
+    ProfileMap profile() {
+        ProfileMap map;
+        profile(map);
+        return map;
+    }
+
+    GraphViewNode *graph_view(GraphView *gv) override {
+        auto &arena = gv->arena;
+        auto &map = gv->node_map;
+
+        auto *view = GraphView::make_graph(arena, this);
+        map[this] = view;
+        gv->all_graphs.push_back(view);
+
+        // nodes
+        for (auto &node : nodes_) {
+            auto *child = node->graph_view(gv);
+            child->parent = view;
+            view->graph.nodes.push_back(child);
+        }
+
+        // input edges
+        type_list_map<InputTypes>([&]<typename T>() {
+            for (auto &edge : input_.template edges<T>()) {
+                auto *receiver = reinterpret_cast<Node *>(edge.receiver);
+                if (auto it = map.find(receiver); it != map.end()) {
+                    view->graph.input_edges.push_back({it->second, type_to_string<T>()});
+                }
+            }
+        });
+
+        // inner edges (deferred: resolved after all nodes are in the map)
+        for (auto const &conn : connections_) {
+            gv->pending_connections.push_back({conn.sender, conn.receiver, conn.type_name, view});
+        }
+
+        // output edges
+        type_list_map<OutputTypes>([&]<typename T>() {
+            for (auto *node : output_.template nodes<T>()) {
+                if (auto it = map.find(node); it != map.end()) {
+                    view->graph.output_edges.push_back({it->second, type_to_string<T>()});
+                }
+            }
+        });
+        for (auto &node : output_nodes_) {
+            if (auto it = map.find(node.get()); it != map.end()) {
+                propagate_output_edges(it->second, view->graph.output_edges);
+            }
+        }
+        return view;
+    }
+
+    GraphView build_graph_view() {
+        GraphView gv;
+        gv.root = this->graph_view(&gv);
+        gv.resolve_pending_connections();
+        return gv;
+    }
+
+    // edges ///////////////////////////////////////////////////////////////////
+
+    //
+    // Input-side edge flattening: draw_edge<T> and connect_input<T> detect
+    // when the receiver/node is a Graph and bypass GraphInput by reusing inner
+    // edge transfer functions. Output-side flattening uses deferred
+    // EdgeConnectors that chain through sub-graph boundaries.
+    //
+
+    template <typename T>
+    Edge<T> build_edge(auto sender, auto receiver) {
+        return EdgeBuilder::template make_edge<T>(this, sender, receiver);
+    }
+
+    template <typename ConcreteNode>
+    void register_node(std::shared_ptr<ConcreteNode> node) {
+        if (node->parent() != nullptr) return;
+        node->parent(this);
+        nodes_.insert(node);
+        runner_->register_node(node.get());
+    }
+
+    //
+    // Edge creation for a type: create an edge between 2 nodes_ for a specific
+    // type.
+    //
+    // - We do not verify if the edge already exists, creating multiple edges
+    //   for the same sender/receiver/type is allowed.
+    // - Sub-graphs input edges are not flattened when a custom edge is used.
+    //
+
+    template <typename T>
+    void draw_edge(auto sender, auto receiver, Edge<T> edge) {
+        register_node(sender);
+        register_node(receiver);
+        connections_.push_back(Connection{sender.get(), receiver.get(), type_to_string<T>()});
+        sender->connect_output_edge(std::move(edge));
+    }
+
+    template <typename T>
+    void draw_edge(auto sender, auto receiver, auto impl) {
+        draw_edge<T>(sender, receiver, make_edge<T>(this, receiver.get(), std::move(impl)));
+    }
+
+    template <typename T>
+    void draw_edge(auto sender, auto receiver) {
+        if constexpr (IsGraph<typename decltype(receiver)::element_type>) {
+            register_node(sender);
+            register_node(receiver);
+            auto& input_edges = receiver->input().template edges<T>();
+            for (auto& input_edge : input_edges) {
+                sender->connect_output_edge(input_edge);
+                connections_.push_back(Connection{
+                    .sender = sender.get(),
+                    .receiver = reinterpret_cast<Node *>(input_edge.receiver),
+                    .type_name = type_to_string<T>(),
+                });
+            }
+        } else {
+            draw_edge(sender, receiver, build_edge<T>(sender.get(), receiver.get()));
+        }
+    }
+
+    //
+    // Edge creation for common types: create an edge between 2 nodes_ for every
+    // types common between the sender outputs and receiver inputs.
+    //
+    // - We do not verify if the edges already exist, creating multiple edges
+    //   for the same sender/receiver/type is allowed.
+    // - Sub-graphs input edges are not flattened when a custom edge is used.
+    //
+
+    template <typename Sender, typename Receiver>
+    void draw_edges(std::shared_ptr<Sender> sender, std::shared_ptr<Receiver> receiver, auto make_edge_fun, HH_LOC) {
+        using sender_outputs = Sender::OutputTypes;
+        using receiver_inputs = Receiver::InputTypes;
+        size_t new_edge_count = 0;
+
+        type_list_map<sender_outputs>([&]<typename T>() {
+            if constexpr (type_list_contains<receiver_inputs, T>) {
+                draw_edge(sender, receiver, make_edge_fun.template operator()<T>(this, sender.get(), receiver.get()));
+                ++new_edge_count;
+            }
+        });
+
+        if (new_edge_count == 0) {
+            log::warning(loc, "failed to draw edges between `", type_to_string<Sender>(),
+                         "` and `", type_to_string<Receiver>(), "` (no common types: `",
+                         type_to_string<sender_outputs>(), "` and `",
+                         type_to_string<receiver_inputs>(), "`).");
+        }
+    }
+
+    template <typename Sender, typename Receiver>
+    void draw_edges(std::shared_ptr<Sender> sender, std::shared_ptr<Receiver> receiver, HH_LOC) {
+        using sender_outputs = Sender::OutputTypes;
+        using receiver_inputs = Receiver::InputTypes;
+        size_t new_edge_count = 0;
+
+        type_list_map<sender_outputs>([&]<typename T>() {
+            if constexpr (type_list_contains<receiver_inputs, T>) {
+                draw_edge<T>(sender, receiver);
+                ++new_edge_count;
+            }
+        });
+
+        if (new_edge_count == 0) {
+            log::warning(loc, "failed to draw edges between `", type_to_string<Sender>(),
+                         "` and `", type_to_string<Receiver>(), "` (no common types: `",
+                         type_to_string<sender_outputs>(), "` and `",
+                         type_to_string<receiver_inputs>(), "`).");
+        }
+    }
+
+    // inputs & outputs ////////////////////////////////////////////////////////
+
+    //
+    // Set graph inputs.
+    //
+    // When the connected node is a task, the edge transfering data to this
+    // task is added to the edge slot list. When it is a sub-graph and no
+    // custom edge is specified, the input edges of the sub-graph are added to
+    // the input edge list of the current graph to guaranty direct data
+    // transfer to the sub-graph's input nodes (works recursively when there
+    // are multiple layers of sub-graphs).
+    //
+
+    template <typename T>
+    void connect_input(auto node, Edge<T> edge) {
+        register_node(node);
+        input_nodes_.insert(node);
+        input_.connect_edge(std::move(edge));
+    }
+
+    template <typename T>
+    void connect_input(auto node, auto impl) {
+        connect_input<T>(node, make_edge<T>(this, node.get(), std::move(impl)));
+    }
+
+    template <typename T>
+    void connect_input(auto node) {
+        register_node(node);
+        input_nodes_.insert(node);
+        if constexpr (IsGraph<typename decltype(node)::element_type>) {
+            auto& input_edges = node->input().template edges<T>();
+            for (auto& input_edge : input_edges) {
+                input_.connect_edge(input_edge);
+            }
+        } else {
+            input_.connect_edge(build_edge<T>((Node *)nullptr, node.get()));
+        }
+    }
+
+    template <typename Node>
+    void connect_inputs(std::shared_ptr<Node> node, auto make_edge_fun, HH_LOC) {
+        using node_inputs = Node::InputTypes;
+        size_t new_connection_count = 0;
+
+        type_list_map<InputTypes>([&]<typename T>() {
+            if constexpr (type_list_contains<node_inputs, T>) {
+                connect_input(node, make_edge_fun.template operator()<T>(this, (Node*)nullptr, node.get()));
+                ++new_connection_count;
+            }
+        });
+
+        if (new_connection_count == 0) {
+            log::warning(loc, "failed to connect node `", type_to_string<Node>(),
+                         "` as input (no common types: `", type_to_string<node_inputs>(),
+                         "` and `", type_to_string<InputTypes>(), "`).");
+        }
+    }
+
+    template <typename Node>
+    void connect_inputs(std::shared_ptr<Node> node, HH_LOC) {
+        using node_inputs = Node::InputTypes;
+        size_t new_connection_count = 0;
+
+        type_list_map<InputTypes>([&]<typename T>() {
+            if constexpr (type_list_contains<node_inputs, T>) {
+                connect_input<T>(node);
+                ++new_connection_count;
+            }
+        });
+
+        if (new_connection_count == 0) {
+            log::warning(loc, "failed to connect node `", type_to_string<Node>(),
+                         "` as input (no common types: `", type_to_string<node_inputs>(),
+                         "` and `", type_to_string<InputTypes>(), "`).");
+        }
+    }
+
+    //
+    // Set graph outputs.
+    //
+    // Graph output doesn't add edges, instead it registers a lambda that will
+    // connect given edges to the output node (the edge connection is deferred
+    // because the receiver is not known yet). This allows creating direct
+    // connections between sub-graphs output nodes and nodes in the parent
+    // graph.
+    //
+
+    template <typename T>
+    void connect_output(auto node) {
+        using NodeType = decltype(node)::element_type;
+        register_node(node);
+        output_nodes_.insert(node);
+        if constexpr (!IsGraph<NodeType> && !IsPipeline<NodeType>) {
+            output_.template add_node<T>(node.get());
+        }
+        output_.template add_connect<T>([node, this](Edge<T> edge) {
+            if constexpr (!IsGraph<NodeType> && !IsPipeline<NodeType>) {
+                if (edge.receiver != static_cast<void *>(&sink_)) {
+                    connections_.push_back(Connection{
+                        .sender = node.get(),
+                        .receiver = static_cast<Node *>(edge.receiver),
+                        .type_name = type_to_string<T>(),
+                    });
+                }
+            }
+            node->connect_output_edge(std::move(edge));
+        });
+    }
+
+    template <typename Node>
+    void connect_outputs(std::shared_ptr<Node> node, HH_LOC) {
+        using node_outputs = Node::OutputTypes;
+        size_t new_connection_count = 0;
+
+        type_list_map<OutputTypes>([&]<typename T>() {
+            if constexpr (type_list_contains<node_outputs, T>) {
+                connect_output<T>(node);
+                ++new_connection_count;
+            }
+        });
+
+        if (new_connection_count == 0) {
+            log::warning(loc, "failed to connect node `", type_to_string<Node>(),
+                         "` as output (no common types: `", type_to_string<node_outputs>(),
+                         "` and `", type_to_string<OutputTypes>(), "`).");
+        }
+    }
+
+    // profiling ///////////////////////////////////////////////////////////////
+
+    void generate_dot_file(std::string const &filename) {
+        auto gv = this->build_graph_view();
+        std::ofstream ofs(filename);
+        #ifdef HH_ENABLE_PROFILING
+        auto profiles = this->profile();
+        graph_view_to_dot(*gv.root, profiles, ofs);
+        #else
+        graph_view_to_dot(*gv.root, ofs);
+        #endif
+    }
+};
+
+} // end namespace hh
+
+#endif
